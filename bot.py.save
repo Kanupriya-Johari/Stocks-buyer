@@ -1,0 +1,143 @@
+import logging, schedule, time, pytz, os
+from datetime import datetime
+
+import config, notifier
+from auto_login import get_kite
+from risk_manager import RiskManager
+from order_engine import OrderEngine
+import data_fetcher, strategy_swing
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    handlers=[logging.FileHandler('logs/bot.log'), logging.StreamHandler()]
+)
+logger = logging.getLogger('bot')
+
+IST    = pytz.timezone('Asia/Kolkata')
+kite   = None
+rm     = RiskManager()
+engine = None
+
+
+def is_market_day():
+    return datetime.now(IST).weekday() < 5
+
+
+def refresh_login():
+    global kite, engine
+    if not is_market_day(): return
+    logger.info('Refreshing Zerodha login...')
+    try:
+        if os.path.exists(config.TOKEN_FILE):
+            os.remove(config.TOKEN_FILE)
+        kite   = get_kite()
+        engine = OrderEngine(kite, rm)
+        logger.info('Login refreshed OK')
+    except Exception as e:
+        logger.error(f'Login refresh failed: {e}')
+        notifier.send(f'❌ BOT LOGIN FAILED\nError: {e}')
+
+
+def run_exit_checks():
+    if not is_market_day() or engine is None: return
+    if not rm.positions:
+        logger.info('No open positions to check.')
+        return
+    logger.info(f'Exit check for: {list(rm.positions.keys())}')
+    engine.check_exits()
+
+
+def scan_batch(symbols, batch_num):
+    if not is_market_day() or engine is None: return
+    total = len(config.SWING_SYMBOLS)
+    logger.info(f'--- Batch {batch_num} ({len(symbols)}/{total} symbols) ---')
+    for symbol in symbols:
+        try:
+            ok, reason = rm.can_enter(symbol)
+            if not ok:
+                logger.info(f'{symbol}: SKIP — {reason}')
+                continue
+            df = data_fetcher.get_daily_data(symbol, days=120)
+            if df.empty:
+                logger.warning(f'{symbol}: No data')
+                continue
+            sig = strategy_swing.get_signal(df)
+            if sig['signal'] == 'BUY':
+                qty = rm.calc_qty(sig['entry'], sig['stop_loss'])
+                if qty > 0:
+                    engine.place_buy_order(
+                        symbol, qty,
+                        sig['entry'], sig['stop_loss'], sig['target']
+                    )
+            elif sig['signal'] == 'EXIT':
+                if symbol in rm.positions:
+                    engine.place_sell_order(
+                        symbol, rm.positions[symbol]['qty'], 'MACD EXIT'
+                    )
+            else:
+                logger.info(f'{symbol}: No signal')
+        except Exception as e:
+            logger.error(f'Scan error {symbol}: {e}')
+
+
+def run_swing_scan_batch1():
+    syms = config.SWING_SYMBOLS
+    scan_batch(syms[:len(syms)//2], batch_num=1)
+
+
+def run_swing_scan_batch2():
+    syms = config.SWING_SYMBOLS
+    scan_batch(syms[len(syms)//2:], batch_num=2)
+
+
+def daily_report():
+    open_pos = ', '.join(rm.positions.keys()) or 'None'
+    notifier.send(
+        f'📊 EOD REPORT\n'
+        f'Symbols scanned: {len(config.SWING_SYMBOLS)}\n'
+        f'Orders today: {rm.orders_today}\n'
+        f'Open positions: {open_pos}\n'
+        f'Day P&L: ₹{rm.daily_pnl:.2f}\n'
+        f'Status: {"✅ OK" if rm.daily_pnl > -config.MAX_DAILY_LOSS else "⚠️ LOSS LIMIT HIT"}'
+    )
+
+
+def reset_daily():
+    if not is_market_day(): return
+    rm.reset_daily()
+
+
+def main():
+    global kite, engine
+    os.makedirs('logs', exist_ok=True)
+
+    mode = '[PAPER MODE]' if config.PAPER_TRADING else '[LIVE MODE]'
+    logger.info(f'=== ALGO BOT STARTING {mode} ===')
+    logger.info(f'Symbols: {len(config.SWING_SYMBOLS)} | Strategy: RSI+MACD | AI: Gemini 2.0 Flash')
+
+    notifier.send(
+        f'🤖 Bot starting {mode}\n'
+        f'Scanning {len(config.SWING_SYMBOLS)} symbols\n'
+        f'Risk/trade: ₹{config.RISK_PER_TRADE}'
+    )
+
+    kite   = get_kite()
+    engine = OrderEngine(kite, rm)
+    logger.info('Login OK — scheduler starting')
+
+    schedule.every().day.at('08:50').do(reset_daily)
+#schedule.every().day.at('09:15').do(refresh_login)
+    schedule.every().day.at('09:20').do(run_exit_checks)
+    schedule.every().day.at('09:25').do(run_swing_scan_batch1)
+    schedule.every().day.at('09:40').do(run_swing_scan_batch2)
+    schedule.every().day.at('15:35').do(daily_report)
+
+    logger.info('Bot running. Ctrl+C to stop.')
+    while True:
+        schedule.run_pending()
+        time.sleep(30)
+
+
+if __name__ == '__main__':
+    main()

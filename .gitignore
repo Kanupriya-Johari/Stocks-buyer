@@ -1,0 +1,7 @@
+.env
+config.py
+logs/
+__pycache__/
+*.pyc
+get_token.py
+venv/
